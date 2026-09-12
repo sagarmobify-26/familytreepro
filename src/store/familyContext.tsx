@@ -14,10 +14,8 @@ import {
   subscribeToAuth,
   subscribeToVaultData,
   saveVaultToFirestore,
-  seedInitialVault,
+  initializePersonalVault,
 } from '../services/firebaseService';
-
-const STORAGE_KEY = 'kintree_family_vault_v3';
 
 export type CloudSyncStatus = 'connected' | 'syncing' | 'offline';
 
@@ -40,6 +38,7 @@ interface FamilyContextType {
   activeRole: UserRole;
   isReadOnly: boolean;
   cloudSyncStatus: CloudSyncStatus;
+  vaultName: string;
 
   // Firebase Email/Password Auth
   handleEmailLogin: (email: string, pass: string) => Promise<void>;
@@ -56,7 +55,7 @@ interface FamilyContextType {
   setSelectedMember: (member: FamilyMember | null) => void;
   setSearchQuery: (query: string) => void;
 
-  // Data Mutations
+  // Data Mutations (Direct to Firestore)
   addMemberRelative: (
     data: Omit<FamilyMember, 'id'>,
     relativeToId: string,
@@ -77,62 +76,48 @@ interface FamilyContextType {
 const FamilyContext = createContext<FamilyContextType | null>(null);
 
 export const FamilyProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  // Initialize state from local cache
-  const [members, setMembers] = useState<Record<string, FamilyMember>>(() => {
+  // Active User Session (persisted per session)
+  const [currentUser, setCurrentUser] = useState<UserSession>(() => {
     try {
-      const saved = localStorage.getItem(STORAGE_KEY + '_members');
-      return saved ? JSON.parse(saved) : initialMembers;
+      const saved = localStorage.getItem('kintree_active_user');
+      if (saved) return JSON.parse(saved);
+    } catch {}
+    return {
+      id: '',
+      name: '',
+      role: 'head',
+      roleTitle: 'Family Head',
+      email: '',
+    };
+  });
+
+  const [activeVaultId, setActiveVaultId] = useState<string>(() => {
+    try {
+      return localStorage.getItem('kintree_active_vault_id') || '';
     } catch {
-      return initialMembers;
+      return '';
     }
   });
 
-  const [relationships, setRelationships] = useState<FamilyRelationship[]>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEY + '_rels');
-      return saved ? JSON.parse(saved) : initialRelationships;
-    } catch {
-      return initialRelationships;
-    }
-  });
+  const [vaultName, setVaultName] = useState<string>('Family Heritage Vault');
 
-  const [headId, setHeadId] = useState<string>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEY + '_head');
-      return saved || 'mem-3'; // Rajendra Shah (Family Head)
-    } catch {
-      return 'mem-3';
-    }
-  });
+  // In-memory Members & Relationships for the ACTIVE vault
+  const [members, setMembers] = useState<Record<string, FamilyMember>>({});
+  const [relationships, setRelationships] = useState<FamilyRelationship[]>([]);
+  const [headId, setHeadId] = useState<string>('');
 
   const [currentView, setCurrentView] = useState<AppView>(() => {
     try {
-      const saved = localStorage.getItem(STORAGE_KEY + '_view');
+      const saved = localStorage.getItem('kintree_view');
       return (saved as AppView) || 'login';
     } catch {
       return 'login';
     }
   });
 
-  const [currentUser, setCurrentUser] = useState<UserSession>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEY + '_user');
-      if (saved) return JSON.parse(saved);
-    } catch {}
-    return {
-      id: 'mem-3',
-      name: 'Rajendra Shah',
-      role: 'head',
-      roleTitle: 'Family Head',
-      email: 'rajendra.shah@kintree.org',
-      avatarUrl: 'https://images.unsplash.com/photo-1472099645785-5658abf4ff4e?w=150&auto=format&fit=crop&q=80',
-      branchName: 'Ahmedabad Main Vault',
-    };
-  });
-
   const [cloudSyncStatus, setCloudSyncStatus] = useState<CloudSyncStatus>('syncing');
 
-  // UI state
+  // UI modal states
   const [selectedMember, setSelectedMember] = useState<FamilyMember | null>(null);
   const [memberToAddRelativeTo, setMemberToAddRelativeTo] = useState<FamilyMember | null>(null);
   const [isAddModalOpen, setIsAddModalOpen] = useState<boolean>(false);
@@ -142,49 +127,116 @@ export const FamilyProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
   const isSavingToCloud = useRef(false);
 
-  // 1. Subscribe to Firebase Auth State
+  // 1. Firebase Auth listener - Auto-redirects whenever an authenticated user is present
   useEffect(() => {
     const unsub = subscribeToAuth((firebaseUser) => {
       if (firebaseUser) {
-        setCurrentUser((prev) => ({
-          ...prev,
+        const expectedVaultId = `vault_${firebaseUser.uid}`;
+        setActiveVaultId(expectedVaultId);
+        localStorage.setItem('kintree_active_vault_id', expectedVaultId);
+
+        const displayName =
+          firebaseUser.displayName ||
+          currentUser.name ||
+          firebaseUser.email?.split('@')[0] ||
+          'Family Head';
+
+        const userSession: UserSession = {
           id: firebaseUser.uid,
-          name: firebaseUser.displayName || firebaseUser.email?.split('@')[0] || prev.name,
-          email: firebaseUser.email || prev.email,
-        }));
+          name: displayName,
+          role: 'head',
+          roleTitle: 'Family Head',
+          email: firebaseUser.email || '',
+        };
+
+        setCurrentUser(userSession);
+        localStorage.setItem('kintree_active_user', JSON.stringify(userSession));
+
+        // Redirect immediately to dashboard on valid auth!
+        setCurrentView((prev) => (prev === 'login' ? 'dashboard' : prev));
+      } else {
+        // If not logged in and not in demo mode
+        const savedVault = localStorage.getItem('kintree_active_vault_id');
+        if (!savedVault?.startsWith('demo_')) {
+          setCurrentView((prev) => (prev === 'login' ? 'login' : 'login'));
+        }
       }
     });
     return () => unsub();
   }, []);
 
-  // 2. Real-time Firestore Vault Sync
+  // 2. Real-time Firestore Vault Subscription (Scoped to activeVaultId)
   useEffect(() => {
+    if (!activeVaultId) {
+      setCloudSyncStatus('offline');
+      return;
+    }
+
     setCloudSyncStatus('syncing');
 
+    // Handle demo vault locally
+    if (activeVaultId === 'demo_shah_vault') {
+      setMembers(initialMembers);
+      setRelationships(initialRelationships);
+      setHeadId('mem-3');
+      setVaultName('Shah Family Heritage');
+      setCloudSyncStatus('connected');
+      return;
+    }
+
+    // Set default initial member for this user immediately so canvas is not empty while waiting for network
+    if (currentUser.id && Object.keys(members).length === 0) {
+      const nameParts = (currentUser.name || 'Me').trim().split(' ');
+      const fName = nameParts[0] || 'Me';
+      const lName = nameParts.slice(1).join(' ') || '';
+      const fFamilyName = lName ? `${lName} Family Heritage` : `${fName}'s Family Heritage`;
+      const fallbackHeadId = `mem_${currentUser.id.substring(0, 8)}`;
+
+      setMembers({
+        [fallbackHeadId]: {
+          id: fallbackHeadId,
+          firstName: fName,
+          lastName: lName,
+          gender: 'female',
+          roleTitle: 'Family Head',
+          isFamilyHead: true,
+          email: currentUser.email,
+        },
+      });
+      setHeadId(fallbackHeadId);
+      setVaultName(fFamilyName);
+    }
+
     const unsubscribe = subscribeToVaultData(
-      'shah-family-archive',
-      (cloudData) => {
+      activeVaultId,
+      (vaultDoc) => {
         if (!isSavingToCloud.current) {
-          if (cloudData.members && Object.keys(cloudData.members).length > 0) {
-            setMembers(cloudData.members);
+          if (vaultDoc.members && Object.keys(vaultDoc.members).length > 0) {
+            setMembers(vaultDoc.members);
           }
-          if (cloudData.relationships) {
-            setRelationships(cloudData.relationships);
+          if (vaultDoc.relationships) {
+            setRelationships(vaultDoc.relationships);
           }
-          if (cloudData.headId) {
-            setHeadId(cloudData.headId);
+          if (vaultDoc.headId) {
+            setHeadId(vaultDoc.headId);
+          }
+          if (vaultDoc.vaultName) {
+            setVaultName(vaultDoc.vaultName);
           }
         }
         setCloudSyncStatus('connected');
       },
       async (err) => {
-        if (err.message === 'VAULT_NOT_FOUND') {
-          // Auto-seed vault on first cloud setup
+        if (err.message === 'VAULT_NOT_FOUND' && currentUser.id) {
           try {
-            await seedInitialVault(initialMembers, initialRelationships, 'mem-3');
+            await initializePersonalVault(
+              currentUser.id,
+              activeVaultId,
+              currentUser.name || 'My Family',
+              currentUser.email || ''
+            );
             setCloudSyncStatus('connected');
-          } catch (seedErr) {
-            console.warn('Vault auto-seeding deferred:', seedErr);
+          } catch {
             setCloudSyncStatus('offline');
           }
         } else {
@@ -194,41 +246,37 @@ export const FamilyProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     );
 
     return () => unsubscribe();
-  }, []);
+  }, [activeVaultId, currentUser.id, currentUser.name, currentUser.email]);
 
-  // 3. Local Cache Persistence
+  // 3. Persist navigation view
   useEffect(() => {
     try {
-      localStorage.setItem(STORAGE_KEY + '_members', JSON.stringify(members));
-      localStorage.setItem(STORAGE_KEY + '_rels', JSON.stringify(relationships));
-      localStorage.setItem(STORAGE_KEY + '_head', headId);
-      localStorage.setItem(STORAGE_KEY + '_view', currentView);
-      localStorage.setItem(STORAGE_KEY + '_user', JSON.stringify(currentUser));
-    } catch (e) {
-      console.error('Failed to save to local cache', e);
-    }
-  }, [members, relationships, headId, currentView, currentUser]);
+      localStorage.setItem('kintree_view', currentView);
+    } catch {}
+  }, [currentView]);
 
   const familyHead = members[headId] || null;
   const isReadOnly = currentUser.role === 'viewer';
 
-  // Helper to persist updates to Firestore
+  // Cloud Sync Mutation Helper
   const syncChangeToCloud = async (
     nextMembers: Record<string, FamilyMember>,
     nextRels: FamilyRelationship[],
     nextHead: string
   ) => {
+    if (!activeVaultId || activeVaultId.startsWith('demo_')) return;
+
     isSavingToCloud.current = true;
     try {
-      await saveVaultToFirestore(nextMembers, nextRels, nextHead);
+      await saveVaultToFirestore(activeVaultId, nextMembers, nextRels, nextHead, vaultName);
       setCloudSyncStatus('connected');
     } catch (err) {
-      console.warn('Cloud sync error (persisted locally):', err);
+      console.warn('Firestore sync error:', err);
       setCloudSyncStatus('offline');
     } finally {
       setTimeout(() => {
         isSavingToCloud.current = false;
-      }, 500);
+      }, 400);
     }
   };
 
@@ -245,80 +293,113 @@ export const FamilyProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     );
   }, [members, searchQuery]);
 
-  // Auth Handlers
+  // ---------------------------------------------------------------------------
+  // Auth Actions (Immediate Navigation)
+  // ---------------------------------------------------------------------------
+
   const handleEmailLogin = async (email: string, pass: string) => {
-    const user = await signInWithEmail(email, pass);
-    setCurrentUser((prev) => ({
-      ...prev,
+    // Clear previous state
+    setMembers({});
+    setRelationships([]);
+
+    const { user, vaultId, role } = await signInWithEmail(email, pass);
+
+    const displayName = user.displayName || email.split('@')[0];
+    const userSession: UserSession = {
       id: user.uid,
-      name: user.displayName || email.split('@')[0],
+      name: displayName,
+      role,
+      roleTitle: role === 'head' ? 'Family Head' : role === 'contributor' ? 'Branch Contributor' : 'Family Viewer',
       email: user.email || email,
-    }));
+    };
+
+    setCurrentUser(userSession);
+    setActiveVaultId(vaultId);
+    localStorage.setItem('kintree_active_user', JSON.stringify(userSession));
+    localStorage.setItem('kintree_active_vault_id', vaultId);
+
+    // Immediate view redirect!
     setCurrentView('dashboard');
   };
 
   const handleEmailSignUp = async (email: string, pass: string, name: string, role: UserRole) => {
-    const user = await signUpWithEmail(email, pass, name, role);
-    const roleTitle =
-      role === 'head'
-        ? 'Family Head'
-        : role === 'contributor'
-        ? 'Branch Contributor'
-        : 'Family Viewer';
+    setMembers({});
+    setRelationships([]);
 
-    setCurrentUser({
+    const { user, vaultId } = await signUpWithEmail(email, pass, name, role);
+
+    const userSession: UserSession = {
       id: user.uid,
       name: name || email.split('@')[0],
       role,
-      roleTitle,
+      roleTitle: role === 'head' ? 'Family Head' : role === 'contributor' ? 'Branch Contributor' : 'Family Viewer',
       email: user.email || email,
-      branchName: 'Shah Family Archive',
-    });
+    };
+
+    setCurrentUser(userSession);
+    setActiveVaultId(vaultId);
+    localStorage.setItem('kintree_active_user', JSON.stringify(userSession));
+    localStorage.setItem('kintree_active_vault_id', vaultId);
+
+    // Immediate view redirect!
     setCurrentView('dashboard');
   };
 
   const loginWithRole = (role: UserRole, personaMemberId?: string) => {
-    const targetId =
-      personaMemberId ||
-      (role === 'head' ? 'mem-3' : role === 'contributor' ? 'mem-7' : 'mem-13');
+    const targetId = personaMemberId || (role === 'head' ? 'mem-3' : role === 'contributor' ? 'mem-7' : 'mem-13');
+    const m = initialMembers[targetId] || initialMembers['mem-3'];
 
-    const m = members[targetId] || members['mem-3'];
-    const roleTitle =
-      role === 'head'
-        ? 'Family Head'
-        : role === 'contributor'
-        ? 'Branch Contributor'
-        : 'Family Viewer';
-
-    const user: UserSession = {
+    const userSession: UserSession = {
       id: m.id,
       name: `${m.firstName} ${m.lastName}`,
       role,
-      roleTitle,
+      roleTitle: role === 'head' ? 'Family Head' : role === 'contributor' ? 'Branch Contributor' : 'Family Viewer',
       email: m.email || `${m.firstName.toLowerCase()}@kintree.org`,
       avatarUrl: m.profileImage,
-      branchName: role === 'contributor' ? 'Mumbai Branch' : 'Shah Family Heritage',
+      branchName: 'Shah Family Archive',
     };
 
-    setCurrentUser(user);
+    setCurrentUser(userSession);
+    setActiveVaultId('demo_shah_vault');
+    localStorage.setItem('kintree_active_user', JSON.stringify(userSession));
+    localStorage.setItem('kintree_active_vault_id', 'demo_shah_vault');
+
     setCurrentView('dashboard');
+  };
+
+  const loginAsFamilyHead = (memberId: string) => {
+    if (members[memberId]) {
+      setHeadId(memberId);
+      syncChangeToCloud(members, relationships, memberId);
+    }
   };
 
   const logoutToLogin = async () => {
     try {
       await logOutFirebase();
     } catch {}
+
+    setMembers({});
+    setRelationships([]);
+    setHeadId('');
+    setActiveVaultId('');
+    setCurrentUser({
+      id: '',
+      name: '',
+      role: 'head',
+      roleTitle: 'Family Head',
+      email: '',
+    });
+
+    localStorage.removeItem('kintree_active_user');
+    localStorage.removeItem('kintree_active_vault_id');
     setCurrentView('login');
   };
 
-  const loginAsFamilyHead = (memberId: string) => {
-    if (members[memberId]) {
-      setHeadId(memberId);
-      loginWithRole('head', memberId);
-    }
-  };
+  // ---------------------------------------------------------------------------
+  // Modal Navigation
+  // ---------------------------------------------------------------------------
 
-  // Modal controls
   const openAddRelativeModal = (relativeTo?: FamilyMember) => {
     if (isReadOnly) {
       alert('Family Viewers have read-only permissions.');
@@ -344,7 +425,10 @@ export const FamilyProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     setIsDrawerEditing(false);
   };
 
-  // Add Member Relative to Existing Node
+  // ---------------------------------------------------------------------------
+  // Data Mutations (Direct Firestore Sync)
+  // ---------------------------------------------------------------------------
+
   const addMemberRelative = (
     data: Omit<FamilyMember, 'id'>,
     relativeToId: string,
@@ -352,13 +436,13 @@ export const FamilyProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   ): FamilyMember => {
     if (isReadOnly) throw new Error('Read-only permissions');
 
-    const newId = 'mem-' + Date.now().toString(36) + Math.random().toString(36).substring(2, 5);
+    const newId = 'mem_' + Date.now().toString(36) + Math.random().toString(36).substring(2, 5);
     const newMember: FamilyMember = { ...data, id: newId };
     const newRels: FamilyRelationship[] = [];
 
     if (relativeType === 'child') {
       newRels.push({
-        id: `rel-${Date.now()}-1`,
+        id: `rel_${Date.now()}_1`,
         sourceMemberId: relativeToId,
         targetMemberId: newId,
         type: 'parent',
@@ -375,7 +459,7 @@ export const FamilyProvider: React.FC<{ children: React.ReactNode }> = ({ childr
             ? spouseRel.targetMemberId
             : spouseRel.sourceMemberId;
         newRels.push({
-          id: `rel-${Date.now()}-2`,
+          id: `rel_${Date.now()}_2`,
           sourceMemberId: spouseId,
           targetMemberId: newId,
           type: 'parent',
@@ -383,14 +467,14 @@ export const FamilyProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       }
     } else if (relativeType === 'spouse') {
       newRels.push({
-        id: `rel-${Date.now()}-spouse`,
+        id: `rel_${Date.now()}_spouse`,
         sourceMemberId: relativeToId,
         targetMemberId: newId,
         type: 'spouse',
       });
     } else if (relativeType === 'parent') {
       newRels.push({
-        id: `rel-${Date.now()}-parent`,
+        id: `rel_${Date.now()}_parent`,
         sourceMemberId: newId,
         targetMemberId: relativeToId,
         type: 'parent',
@@ -402,7 +486,7 @@ export const FamilyProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       if (parentRels.length > 0) {
         parentRels.forEach((pr, index) => {
           newRels.push({
-            id: `rel-${Date.now()}-sib-${index}`,
+            id: `rel_${Date.now()}_sib_${index}`,
             sourceMemberId: pr.sourceMemberId,
             targetMemberId: newId,
             type: 'parent',
@@ -424,14 +508,17 @@ export const FamilyProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
   const addStandaloneMember = (data: Omit<FamilyMember, 'id'>): FamilyMember => {
     if (isReadOnly) throw new Error('Read-only permissions');
-    const newId = 'mem-' + Date.now().toString(36);
+
+    const newId = 'mem_' + Date.now().toString(36);
     const newMember: FamilyMember = { ...data, id: newId };
     const nextMembers = { ...members, [newId]: newMember };
+    const nextHead = headId || newId;
 
     setMembers(nextMembers);
+    if (!headId) setHeadId(newId);
     closeAddModal();
 
-    syncChangeToCloud(nextMembers, relationships, headId);
+    syncChangeToCloud(nextMembers, relationships, nextHead);
     return newMember;
   };
 
@@ -466,7 +553,7 @@ export const FamilyProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   const addRelationship = (sourceId: string, targetId: string, type: RelationshipType) => {
     if (isReadOnly) return;
     const newRel: FamilyRelationship = {
-      id: `rel-${Date.now()}`,
+      id: `rel_${Date.now()}`,
       sourceMemberId: sourceId,
       targetMemberId: targetId,
       type,
@@ -491,7 +578,7 @@ export const FamilyProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   };
 
   const exportJSON = (): string => {
-    return JSON.stringify({ members, relationships, headId, version: '5.3-firebase' }, null, 2);
+    return JSON.stringify({ vaultId: activeVaultId, vaultName, members, relationships, headId }, null, 2);
   };
 
   const importJSON = (jsonStr: string): boolean => {
@@ -530,6 +617,7 @@ export const FamilyProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         activeRole: currentUser.role,
         isReadOnly,
         cloudSyncStatus,
+        vaultName,
 
         handleEmailLogin,
         handleEmailSignUp,

@@ -61,8 +61,10 @@ export const RoleSelector: React.FC = () => {
       }
     } catch (err: any) {
       console.error('Authentication error:', err);
-      let msg = err.message || 'Authentication failed.';
-      if (err.code === 'auth/invalid-credential' || err.code === 'auth/wrong-password' || err.code === 'auth/user-not-found') {
+      let msg = err?.message || 'Authentication failed. Please check credentials.';
+      if (err.code === 'auth/configuration-not-found') {
+        msg = 'Firebase Authentication is not yet enabled for project famil-c137b. In Firebase Console, go to Build > Authentication, click "Get Started", and enable Email/Password under Sign-in method.';
+      } else if (err.code === 'auth/invalid-credential' || err.code === 'auth/wrong-password' || err.code === 'auth/user-not-found') {
         msg = 'Invalid email or password. Please verify or use "Create Vault Account".';
       } else if (err.code === 'auth/email-already-in-use') {
         msg = 'This email is already registered. Please sign in instead.';

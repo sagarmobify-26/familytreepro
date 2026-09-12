@@ -18,9 +18,11 @@ import { FamilyMember, FamilyRelationship } from '../types/family';
 import { UserRole } from '../types/auth';
 
 const VAULT_COLLECTION = 'vaults';
-const DEFAULT_VAULT_ID = 'shah-family-archive';
+const USERS_COLLECTION = 'users';
 
 export interface VaultDocument {
+  id: string;
+  ownerUid: string;
   vaultName: string;
   headId: string;
   members: Record<string, FamilyMember>;
@@ -28,8 +30,17 @@ export interface VaultDocument {
   updatedAt?: any;
 }
 
+export interface UserProfileDocument {
+  uid: string;
+  email: string;
+  displayName: string;
+  role: UserRole;
+  vaultId: string;
+  createdAt?: any;
+}
+
 // ---------------------------------------------------------------------------
-// Authentication Services (Email/Password)
+// Non-blocking Authentication & User Profile Services
 // ---------------------------------------------------------------------------
 
 export async function signUpWithEmail(
@@ -37,30 +48,67 @@ export async function signUpWithEmail(
   pass: string,
   displayName: string,
   role: UserRole = 'head'
-): Promise<User> {
+): Promise<{ user: User; vaultId: string }> {
   const credential = await createUserWithEmailAndPassword(auth, email, pass);
+  const user = credential.user;
+
   if (displayName) {
-    await updateProfile(credential.user, { displayName });
+    try {
+      await updateProfile(user, { displayName });
+    } catch {}
   }
 
-  // Record user role profile in Firestore users collection
-  try {
-    await setDoc(doc(db, 'users', credential.user.uid), {
+  const vaultId = `vault_${user.uid}`;
+
+  // Asynchronously record user profile & seed personal vault without blocking login redirect
+  const name = displayName || email.split('@')[0];
+  setDoc(
+    doc(db, USERS_COLLECTION, user.uid),
+    {
+      uid: user.uid,
       email,
-      displayName,
+      displayName: name,
       role,
+      vaultId,
       createdAt: serverTimestamp(),
-    }, { merge: true });
-  } catch (err) {
-    console.warn('Could not write user profile to Firestore:', err);
-  }
+    },
+    { merge: true }
+  ).catch((err) => console.warn('User profile write notice:', err));
 
-  return credential.user;
+  initializePersonalVault(user.uid, vaultId, name, email).catch((err) =>
+    console.warn('Vault init notice:', err)
+  );
+
+  return { user, vaultId };
 }
 
-export async function signInWithEmail(email: string, pass: string): Promise<User> {
+export async function signInWithEmail(
+  email: string,
+  pass: string
+): Promise<{ user: User; vaultId: string; role: UserRole }> {
   const credential = await signInWithEmailAndPassword(auth, email, pass);
-  return credential.user;
+  const user = credential.user;
+  const vaultId = `vault_${user.uid}`;
+  const role: UserRole = 'head';
+
+  // Asynchronously ensure user profile and vault exist in the background
+  const name = user.displayName || email.split('@')[0];
+  setDoc(
+    doc(db, USERS_COLLECTION, user.uid),
+    {
+      uid: user.uid,
+      email: user.email || email,
+      displayName: name,
+      role,
+      vaultId,
+      lastLoginAt: serverTimestamp(),
+    },
+    { merge: true }
+  ).catch(() => {});
+
+  initializePersonalVault(user.uid, vaultId, name, user.email || email).catch(() => {});
+
+  return { user, vaultId, role };
 }
 
 export async function logOutFirebase(): Promise<void> {
@@ -72,14 +120,70 @@ export function subscribeToAuth(callback: (user: User | null) => void) {
 }
 
 // ---------------------------------------------------------------------------
-// Firestore Vault Realtime Sync Services
+// Personalized Vault Initialization
+// ---------------------------------------------------------------------------
+
+export async function initializePersonalVault(
+  uid: string,
+  vaultId: string,
+  fullName: string,
+  email: string
+): Promise<void> {
+  const vaultRef = doc(db, VAULT_COLLECTION, vaultId);
+
+  // Use a timeout so network delays don't hang execution
+  const snapPromise = getDoc(vaultRef);
+  const timeoutPromise = new Promise<null>((resolve) => setTimeout(() => resolve(null), 2500));
+  const snap = await Promise.race([snapPromise, timeoutPromise]);
+
+  if (!snap || !snap.exists()) {
+    const nameParts = fullName.trim().split(' ');
+    const firstName = nameParts[0] || 'Me';
+    const lastName = nameParts.slice(1).join(' ') || '';
+    const familyName = lastName ? `${lastName} Family Heritage` : `${firstName}'s Family Heritage`;
+
+    const headMemberId = `mem_${uid.substring(0, 8)}`;
+    const headMember: FamilyMember = {
+      id: headMemberId,
+      firstName,
+      lastName,
+      gender: 'female',
+      roleTitle: 'Family Head',
+      isFamilyHead: true,
+      email,
+      bio: `Family Head of the ${familyName}.`,
+    };
+
+    await setDoc(
+      vaultRef,
+      {
+        id: vaultId,
+        ownerUid: uid,
+        vaultName: familyName,
+        headId: headMemberId,
+        members: {
+          [headMemberId]: headMember,
+        },
+        relationships: [],
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      },
+      { merge: true }
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Firestore Realtime Sync Services (Scoped per Vault)
 // ---------------------------------------------------------------------------
 
 export function subscribeToVaultData(
-  vaultId = DEFAULT_VAULT_ID,
+  vaultId: string,
   onData: (data: VaultDocument) => void,
   onError: (err: Error) => void
 ) {
+  if (!vaultId) return () => {};
+
   const vaultRef = doc(db, VAULT_COLLECTION, vaultId);
 
   return onSnapshot(
@@ -89,53 +193,36 @@ export function subscribeToVaultData(
         const data = snapshot.data() as VaultDocument;
         onData(data);
       } else {
-        // Vault does not exist yet; we can seed it
         onError(new Error('VAULT_NOT_FOUND'));
       }
     },
     (error) => {
-      console.warn('Firestore subscription notice (using local cache fallback):', error);
+      console.warn(`Firestore subscription notice for ${vaultId}:`, error);
       onError(error);
     }
   );
 }
 
 export async function saveVaultToFirestore(
+  vaultId: string,
   members: Record<string, FamilyMember>,
   relationships: FamilyRelationship[],
   headId: string,
-  vaultId = DEFAULT_VAULT_ID
+  vaultName?: string
 ): Promise<void> {
-  const vaultRef = doc(db, VAULT_COLLECTION, vaultId);
-  await setDoc(
-    vaultRef,
-    {
-      vaultName: 'Shah Family Archive',
-      headId,
-      members,
-      relationships,
-      updatedAt: serverTimestamp(),
-    },
-    { merge: true }
-  );
-}
+  if (!vaultId) return;
 
-export async function seedInitialVault(
-  members: Record<string, FamilyMember>,
-  relationships: FamilyRelationship[],
-  headId: string,
-  vaultId = DEFAULT_VAULT_ID
-): Promise<void> {
   const vaultRef = doc(db, VAULT_COLLECTION, vaultId);
-  const snap = await getDoc(vaultRef);
-  if (!snap.exists()) {
-    await setDoc(vaultRef, {
-      vaultName: 'Shah Family Archive',
-      headId,
-      members,
-      relationships,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    });
+  const payload: any = {
+    headId,
+    members,
+    relationships,
+    updatedAt: serverTimestamp(),
+  };
+
+  if (vaultName) {
+    payload.vaultName = vaultName;
   }
+
+  await setDoc(vaultRef, payload, { merge: true });
 }

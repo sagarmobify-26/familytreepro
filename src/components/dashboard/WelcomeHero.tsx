@@ -3,7 +3,7 @@ import { GitFork, UserPlus, Sparkles, ArrowRight } from 'lucide-react';
 import { useFamily } from '../../store/familyContext';
 
 export const WelcomeHero: React.FC = () => {
-  const { currentUser, setCurrentView, openAddRelativeModal, isReadOnly, members } = useFamily();
+  const { currentUser, setCurrentView, openAddRelativeModal, isReadOnly, members, vaultName } = useFamily();
   const totalMembers = Object.keys(members).length;
 
   return (
@@ -15,11 +15,11 @@ export const WelcomeHero: React.FC = () => {
         </div>
 
         <h2 className="hero-welcome-title">
-          Welcome back, {currentUser.name.split(' ')[0]}
+          Welcome back, {currentUser.name ? currentUser.name.split(' ')[0] : 'Member'}
         </h2>
 
         <p className="hero-subtitle-line">
-          Shah Family Tree • <strong>4 Generations</strong>, <strong>{totalMembers} Members</strong> Recorded
+          {vaultName || 'Family Tree'} • <strong>{totalMembers} Members</strong> Recorded
         </p>
 
         <div className="hero-action-buttons">

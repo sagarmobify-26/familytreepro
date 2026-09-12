@@ -30,6 +30,7 @@ export const TopBar: React.FC = () => {
     exportJSON,
     isReadOnly,
     cloudSyncStatus,
+    vaultName,
   } = useFamily();
 
   const [showProfileMenu, setShowProfileMenu] = useState(false);
@@ -59,7 +60,7 @@ export const TopBar: React.FC = () => {
       {/* Heritage Info Left */}
       <div className="topbar-left">
         <div>
-          <h2 className="topbar-vault-title">Shah Family Heritage</h2>
+          <h2 className="topbar-vault-title">{vaultName || 'Family Heritage Vault'}</h2>
           <div className="topbar-meta-row">
             <span className="meta-badge-generation">4 Generations</span>
             <span className="meta-divider">•</span>

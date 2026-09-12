@@ -12,7 +12,7 @@ import { useFamily } from '../../store/familyContext';
 import { AppView } from '../../types/auth';
 
 export const Sidebar: React.FC = () => {
-  const { currentView, setCurrentView } = useFamily();
+  const { currentView, setCurrentView, vaultName } = useFamily();
 
   const navItems: { id: AppView; label: string; icon: React.ReactNode; badge?: string }[] = [
     { id: 'dashboard', label: 'Family Vault', icon: <LayoutDashboard size={18} /> },
@@ -44,8 +44,8 @@ export const Sidebar: React.FC = () => {
         {/* Vault Banner */}
         <div className="sidebar-vault-card">
           <span className="vault-label">FAMILY VAULT</span>
-          <h4 className="vault-name">Shah Family Archive</h4>
-          <span className="vault-origin">Gujarat • Est. 1928</span>
+          <h4 className="vault-name">{vaultName || 'Family Heritage Vault'}</h4>
+          <span className="vault-origin">Secured Archive</span>
         </div>
       </div>
 
